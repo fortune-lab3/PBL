@@ -1,0 +1,63 @@
+
+
+# ==============================
+# ✅ 要約スクリプト
+# ==============================
+import os, time
+from huggingface_hub import InferenceClient
+from httpx import ConnectTimeout, ReadTimeout, HTTPError
+
+# 🔑 Hugging Face トークンを設定
+os.environ["HUGGINGFACEHUB_API_TOKEN"] = ""
+
+MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
+HF_TOKEN = os.environ["HUGGINGFACEHUB_API_TOKEN"]
+
+def summarize_api(text: str, max_tokens: int = 280, temperature: float = 0.3) -> str:
+    """
+    Qwen3-4B-Instruct を使って日本語の要約を生成します。
+    """
+    if not HF_TOKEN:
+        raise RuntimeError("HUGGINGFACEHUB_API_TOKEN が設定されていません。")
+
+    client = InferenceClient(model=MODEL_ID, token=HF_TOKEN, timeout=60.0)
+
+    prompt = (
+        "あなたは日本語の要約アシスタントです。以下の文章を3〜4行で自然に要約してください。\n"
+        "プレゼントキャンペーンなどの不要な情報は省き、読みやすくまとめてください。\n\n"
+        f"【入力】\n{text}\n\n【要約】"
+    )
+
+    # 簡易リトライ付き
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return resp.choices[0].message["content"].strip()
+        except (ConnectTimeout, ReadTimeout):
+            print(f"⚠️ タイムアウト: {attempt+1} 回目のリトライ中...")
+            time.sleep(2 ** attempt)
+        except HTTPError as e:
+            if getattr(e.response, "status_code", 500) >= 500:
+                print(f"⚠️ サーバーエラー ({e.response.status_code})、リトライします...")
+                time.sleep(2 ** attempt)
+            else:
+                raise
+    raise TimeoutError("Qwen API の呼び出しに繰り返し失敗しました。")
+
+# ==============================
+# ✅ 入力 & 実行
+# ==============================
+print("📝 要約したいテキストを入力してください（複数行OK）\n")
+text = ""
+while True:
+    line = input()
+    if line.strip() == "":
+        break
+    text += line + "\n"
+
+print("\n--- 要約結果 ---\n")
+print(summarize_api(text))
