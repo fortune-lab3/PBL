@@ -1,0 +1,213 @@
+!pip install -q "transformers>=4.51.0" accelerate bitsandbytes sentencepiece python-docx pandas
+
+import os
+import glob
+import pandas as pd
+from docx import Document
+import torch
+import time
+import re
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from google.colab import drive # Driveマウントのために追加
+
+# --- 1. Qwen3-14B モデルとトークナイザーの準備 (4bit 量子化) ---
+print("--- 🧠 Qwen3-14B モデルをロード中 (4bit量子化) ---")
+# モデル名が Qwen/Qwen3-14B に変更されている点に注意
+model_name = "Qwen/Qwen3-14B"
+
+# Qwen3-14B は非常に大規模なモデルであり、4bit 量子化でも VRAM (メモリ) が大量に必要です。
+if not torch.cuda.is_available():
+    raise SystemExit("🛑 エラー: Qwen3-14B の実行には GPU (CUDA) が必須です。")
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+)
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        quantization_config=bnb_config,
+    )
+    print("--- ✅ モデルとトークナイザーのロード完了 ---")
+except Exception as e:
+    print(f"🛑 モデルロードエラー: {e}")
+    raise SystemExit("モデルロードに失敗しました。Colabのランタイムタイプが「高性能GPU」であることを確認してください。")
+
+# --- 2. 要約関数 (Qwen3-14B 使用) ---
+def summarize_qwen3(text: str, target_chars: int = 120) -> str:
+    """
+    Qwen3 を使って日本語要約する。
+    """
+
+    user_prompt = (
+        f"次の文章を、日本語で、だいたい {target_chars} 文字程度に自然に要約してください。\n"
+        f"・出力は必ず日本語のみ\n"
+        f"・英語や推論過程（など）を出力しない\n"
+        f"・結果だけ簡潔に\n\n"
+        f"【文章】\n{text}\n\n【要約】"
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "あなたは日本語専用の要約アシスタントです。"
+                "英語や他の言語、推論過程・自己コメントを絶対に出力してはいけません。"
+                "回答は【要約】の後の文章のみとします。"
+            ),
+        },
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # Qwen の Chat Template を適用
+    chat_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        assistant_response=False,
+        enable_thinking=False,
+        response_format="text",
+    )
+
+    # トークン化とモデルへの入力
+    max_input_length = tokenizer.model_max_length - 256 # 生成トークン分を引く
+    inputs = tokenizer(chat_text, return_tensors="pt", max_length=max_input_length, truncation=True).to(model.device)
+
+    # 要約の生成
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=256,
+            temperature=0.3,
+            top_p=0.9,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    gen_ids = generated[0][inputs["input_ids"].shape[1]:]
+    output = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+    # 後処理（プロンプトや余計な記号の除去）
+    if "【要約】" in output:
+        output = output.split("【要約】", 1)[-1].strip()
+
+    output = re.sub(r"\[.*?\]", "", output, flags=re.DOTALL).strip()
+    output = re.sub(r"[a-zA-Z]+", "", output).strip()
+
+    return output
+
+
+# --- 3. Wordファイル読み込み関数 ---
+def read_docx(file_path):
+    """Wordファイル (.docx) からテキストを抽出する関数"""
+    try:
+        document = Document(file_path)
+        full_text = "\n".join([p.text.strip() for p in document.paragraphs if p.text.strip()])
+        return full_text
+    except Exception as e:
+        print(f"  🚨 Wordファイル読み込みエラー {file_path}: {e}")
+        return None
+
+# --- 4. メイン処理関数 (フォルダ内の .docx を要約し CSV に保存) ---
+def summarize_folder_to_csv(folder_path: str, target_chars: int, output_csv: str):
+    """フォルダ内のすべての.docxファイルをQwen3-14Bで要約し、結果をCSVに保存するメイン関数"""
+    #
+
+    if not os.path.isdir(folder_path):
+        print(f"🛑 エラー: 指定されたフォルダが見つかりません。パスを確認してください: {folder_path}")
+        return
+
+    print(f"\n--- フォルダ内の.docxファイルを検索中: {folder_path} ---")
+
+    file_list = glob.glob(os.path.join(folder_path, "*.docx"))
+
+    if not file_list:
+        print("🛑 指定されたフォルダ内に.docxファイルが見つかりませんでした。")
+        return
+
+    results = []
+    print(f"--- ✅ {len(file_list)}個のファイルを見つけました。処理を開始します (モデル: Qwen3-14B) ---")
+
+    for i, file_path in enumerate(file_list):
+        start_time = time.time()
+        file_name = os.path.basename(file_path)
+        print(f"\n[{i+1}/{len(file_list)}] 📄 処理中: {file_name}")
+
+        original_text = read_docx(file_path)
+
+        if original_text and original_text.strip():
+            try:
+                # Qwen3-14B による要約実行
+                summary_text = summarize_qwen3(original_text, target_chars=target_chars)
+
+                actual_length = len(summary_text)
+                elapsed_time = time.time() - start_time
+                print(f"   -> 要約完了 (文字数: {actual_length}, 処理時間: {elapsed_time:.2f}秒)")
+
+                results.append({
+                    "ファイル名": file_name,
+                    "元のテキスト（先頭100文字）": original_text[:100].replace('\n', ' ') + "...",
+                    "要約文字数_希望": target_chars,
+                    "要約文字数_実際": actual_length,
+                    "要約結果": summary_text
+                })
+            except Exception as e:
+                print(f"   🚨 要約中にエラーが発生しました: {e}")
+                results.append({
+                    "ファイル名": file_name,
+                    "元のテキスト（先頭100文字）": "処理エラー",
+                    "要約文字数_希望": target_chars,
+                    "要約文字数_実際": 0,
+                    "要約結果": f"要約エラー: {e}"
+                })
+        else:
+            print("   ⚠️ テキストが空か、読み込めませんでした。スキップします。")
+            results.append({
+                "ファイル名": file_name,
+                "元のテキスト（先頭100文字）": "テキストなし/読み込み失敗",
+                "要約文字数_希望": target_chars,
+                "要約文字数_実際": 0,
+                "要約結果": "処理スキップ"
+            })
+
+    # 結果をPandas DataFrameにしてCSVファイルとして保存
+    if results:
+        df = pd.DataFrame(results)
+        df.to_csv(output_csv, index=False, encoding='utf-8-sig')
+        print(f"\n--- ✅ すべての処理が完了しました。結果をCSVに保存しました: {output_csv} ---")
+    else:
+        print("\n--- 処理対象ファイルがないため、CSVファイルは作成されませんでした。 ---")
+
+# ==================================
+# === 実行部分 (Google Colab / パス固定) ===
+# ==================================
+
+print("\n--- 📂 Google Driveをマウントします ---")
+drive.mount('/content/drive')
+
+# --- ユーザー設定エリア ---
+# 要約対象の .docx が入っている Google Drive 内のフォルダ名を設定してください
+FOLDER_NAME = "tv" # ここを実際のフォルダ名に変更してください
+folder_path = f"/content/drive/MyDrive/{FOLDER_NAME}"
+# --- ユーザー設定エリア終わり ---
+
+print(f"\n--- 🎯 ターゲットフォルダ: {folder_path} ---")
+
+# 目標文字数をユーザーに入力してもらう
+try:
+    target = int(input("だいたい何文字くらいで要約してほしいですか？（推奨：100～250）："))
+except ValueError:
+    print("入力が不正です。デフォルトの120文字を使用します。")
+    target = 120
+
+# 出力ファイル名を設定
+timestamp = time.strftime('%Y%m%d_%H%M%S')
+output_file = os.path.join(folder_path, f"summary_Qwen3_14B_{timestamp}.csv")
+
+# メイン関数を実行
+summarize_folder_to_csv(folder_path, target_chars=target, output_csv=output_file)
