@@ -1,0 +1,323 @@
+#広告文生成のみ
+
+import os, time, re
+from huggingface_hub import InferenceClient
+from httpx import ConnectTimeout, ReadTimeout, HTTPError
+
+MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
+HF_TOKEN = os.environ.get("HUGGINGFACEHUB_API_TOKEN", "ここにAPIを")
+
+# =========================
+# 前処理（1本目から流用）
+# =========================
+def remove_strings(text: str) -> str:
+    pattern = re.compile(r'【.*?】|[ＲR][ー-]\d+|\n|\t|\s+|■|＊')
+    return pattern.sub('', text or "")
+
+# =========================
+# 出力正規化＆文字数カウント
+# =========================
+def normalize_output(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"[a-zA-Z]+", "", text).strip()
+    text = text.replace("\n", "").replace("\r", "")
+    return text
+
+def count_chars(text: str) -> int:
+    return len((text or "").replace("\n", "").replace("\r", ""))
+
+# =========================
+# HF応答抽出（バージョン差異に強く）
+# =========================
+def _extract_message_text(choice) -> str:
+    msg = getattr(choice, "message", None)
+    if msg is not None and not isinstance(msg, dict):
+        content = getattr(msg, "content", None) or getattr(msg, "text", None)
+    elif isinstance(msg, dict):
+        content = msg.get("content") or msg.get("text")
+    else:
+        content = None
+    return str(content or "").strip()
+
+def _call_chat(client: InferenceClient, messages, max_tokens: int, temperature: float) -> str:
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            if not getattr(resp, "choices", None):
+                return ""
+            return _extract_message_text(resp.choices[0])
+
+        except (ConnectTimeout, ReadTimeout):
+            print(f"⚠️ タイムアウト: {attempt+1} 回目のリトライ中...")
+            time.sleep(2 ** attempt)
+
+        except HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", 500)
+            if status >= 500:
+                print(f"⚠️ サーバーエラー ({status})、リトライします...")
+                time.sleep(2 ** attempt)
+            else:
+                raise
+    return ""
+
+# =========================
+# 最終保険：句読点で自然に切る
+# =========================
+def smart_cut_to_sentence(text: str, target_chars: int, lookback: int = 40) -> str:
+    text = normalize_output(text)
+    if len(text) <= target_chars:
+        return text
+
+    head = text[:target_chars]
+    puncts = {"。", "！", "？"}
+    start = max(0, target_chars - lookback)
+
+    cut_pos = -1
+    for i in range(target_chars - 1, start - 1, -1):
+        if head[i] in puncts:
+            cut_pos = i + 1
+            break
+
+    if cut_pos != -1:
+        return head[:cut_pos]
+
+    if target_chars >= 1:
+        head = head[:-1] + "。"
+    return head
+
+# =========================
+# 仕上げ：広告らしい呼びかけを残しつつ「完結」「文末。」「ちょうどN文字」
+# =========================
+def finalize_with_llm(
+    client: InferenceClient,
+    system_prompt: str,
+    ad: str,
+    target_chars: int,
+    max_tokens: int,
+    temperature: float,
+    rounds: int = 8,
+) -> str:
+    ad = normalize_output(ad)
+
+    for _ in range(rounds):
+        length = count_chars(ad)
+        if length == target_chars and ad.endswith("。"):
+            return ad
+
+        prompt = (
+            f"次の文章を、意味を変えずに新聞向けの節度ある広告文として整形してください。\n"
+            f"len()で数えて「{target_chars}文字ちょうど」に必ず合わせます。\n"
+            f"【絶対条件】\n"
+            f"・出力は整形後の文章のみ（前置き・解説・注釈なし）\n"
+            f"・必ず日本語のみ\n"
+            f"・固有名詞（人名/社名/商品名/地名/番組名など）を使わない\n"
+            f"・プレゼントキャンペーン、応募方法、告知だけの文章など本筋に不要な要素は入れない\n"
+            f"・改行なし一段落\n"
+            f"・文章を途中で切らず、必ず完結させる\n"
+            f"・文末は必ず「。」で終える\n"
+            f"・誇大表現や断定は避け、上品で読みやすい表現にする\n"
+            f"・広告文らしく、読者への呼びかけ（例：ぜひ、今こそ、確かめたい、など）や行動を促す一言を必ず入れる\n"
+            f"・文字数は必ず {target_chars} 文字ちょうど\n\n"
+            f"【元の文章（現在{length}文字）】\n{ad}\n\n"
+            f"【整形後（{target_chars}文字ちょうど）】"
+        )
+
+        new_ad = _call_chat(
+            client,
+            [{"role": "system", "content": system_prompt},
+             {"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        if not new_ad:
+            break
+
+        ad = normalize_output(new_ad)
+
+    return ad
+
+# =========================
+# 本体：広告文生成（CTA入り）
+# =========================
+def generate_newspaper_ad_api(
+    text: str,
+    target_chars: int,
+    temperature: float = 0.2,
+    max_adjust_rounds: int = 6,
+) -> str:
+    if not HF_TOKEN:
+        raise RuntimeError("HUGGINGFACEHUB_API_TOKEN が設定されていません。")
+
+    client = InferenceClient(model=MODEL_ID, token=HF_TOKEN, timeout=60.0)
+
+    cleaned = remove_strings(text)
+    cleaned_len = len(cleaned)
+
+    max_tokens = int(target_chars * 2.8) + 220
+
+    system_prompt = (
+        "あなたはテレビ番組の内容をもとに、新聞掲載用の広告文を作成する専門家です。"
+        "必ず日本語のみで回答し、推論過程や自己コメント、タグ、英語を一切出力してはいけません。"
+    )
+
+    # 初回生成：新聞調＋広告らしい呼びかけ（CTA）を必須化
+    user_prompt = (
+        f"次の文章はテレビ番組のナレーション原稿です（約{cleaned_len}文字）。"
+        f"この内容をもとに、新聞に掲載できる広告文を作成してください。\n\n"
+        f"【必須ルール】\n"
+        f"・出力は広告文のみ（前置き・解説・注釈なし）\n"
+        f"・必ず日本語のみ\n"
+        f"・固有名詞（人名/社名/商品名/地名/番組名など）は使わない（一般名詞や言い換えにする）\n"
+        f"・プレゼントキャンペーン、応募方法、告知だけの文章など本筋に不要な要素は入れない\n"
+        f"・不適切な表現や誇大表現を避け、新聞向けに節度ある広告文にする\n"
+        f"・読者に向けた呼びかけや行動を促す一言（例：ぜひ、確かめたい、見逃せない、など）を必ず入れる\n"
+        f"・改行は使わず一段落\n"
+        f"・文章を途中で切らず必ず完結させ、文末は「。」で終える\n"
+        f"・文字数は len()で数えて {target_chars} 文字ちょうど\n\n"
+        f"【原稿】\n{cleaned}\n\n"
+        f"【新聞広告文（{target_chars}文字ちょうど）】"
+    )
+
+    ad = _call_chat(
+        client,
+        [{"role": "system", "content": system_prompt},
+         {"role": "user", "content": user_prompt}],
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    if not ad:
+        return "広告文の生成に失敗しました。"
+
+    ad = normalize_output(ad)
+
+    # 調整ループ：長短の補正（CTAを維持）
+    for _ in range(max_adjust_rounds):
+        length = count_chars(ad)
+        if length == target_chars and ad.endswith("。"):
+            return ad
+
+        if length > target_chars:
+            diff = length - target_chars
+            adjust_prompt = (
+                f"次の新聞広告文は len() で {length} 文字です。指定は {target_chars} 文字ちょうどで、{diff} 文字超えています。\n"
+                f"意味を変えず、固有名詞を使わず、不要なキャンペーン等を入れず、"
+                f"広告文らしい呼びかけ（行動を促す一言）を残したまま、"
+                f"文章を途中で切らずに必ず完結させ、文末「。」で、"
+                f"ちょうど {target_chars} 文字に短く修正してください。\n"
+                f"【厳守】出力は修正文のみ／改行なし／前置き・解説・英語・思考過程は禁止\n\n"
+                f"【元の広告文】\n{ad}\n\n"
+                f"【修正後（{target_chars}文字ちょうど）】"
+            )
+        else:
+            diff = target_chars - length
+            adjust_prompt = (
+                f"次の新聞広告文は len() で {length} 文字です。指定は {target_chars} 文字ちょうどで、{diff} 文字足りません。\n"
+                f"意味を変えず、固有名詞を使わず、不要なキャンペーン等を入れず、"
+                f"広告文らしい呼びかけ（行動を促す一言）を必ず含め、"
+                f"文章を途中で切らずに必ず完結させ、文末「。」で、"
+                f"ちょうど {target_chars} 文字になるよう最小限だけ補って修正してください。\n"
+                f"【厳守】出力は修正文のみ／改行なし／前置き・解説・英語・思考過程は禁止\n\n"
+                f"【元の広告文】\n{ad}\n\n"
+                f"【修正後（{target_chars}文字ちょうど）】"
+            )
+
+        ad_new = _call_chat(
+            client,
+            [{"role": "system", "content": system_prompt},
+             {"role": "user", "content": adjust_prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        if not ad_new:
+            break
+
+        ad = normalize_output(ad_new)
+
+    # 仕上げ（CTA必須で整形）
+    ad = finalize_with_llm(
+        client=client,
+        system_prompt=system_prompt,
+        ad=ad,
+        target_chars=target_chars,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        rounds=10,
+    )
+    ad = normalize_output(ad)
+
+    # まだズレる場合：句読点カット→仕上げ
+    if count_chars(ad) != target_chars or not ad.endswith("。"):
+        ad = smart_cut_to_sentence(ad, target_chars)
+        ad = finalize_with_llm(
+            client=client,
+            system_prompt=system_prompt,
+            ad=ad,
+            target_chars=target_chars,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            rounds=10,
+        )
+        ad = normalize_output(ad)
+
+    # 最終保険
+    if count_chars(ad) != target_chars:
+        ad = smart_cut_to_sentence(ad, target_chars)
+
+    if count_chars(ad) == target_chars and not ad.endswith("。") and target_chars >= 1:
+        ad = ad[:-1] + "。"
+
+    return ad
+
+# =========================
+# CLI：目標文字数入力
+# =========================
+def ask_target_chars(default: int = 120, min_chars: int = 30, max_chars: int = 400) -> int:
+    while True:
+        raw = input(f"📏 目標文字数を入力してください（{min_chars}〜{max_chars}、未入力なら {default}）：").strip()
+        if raw == "":
+            return default
+        if not raw.isdigit():
+            print("⚠️ 数字で入力してください。")
+            continue
+        val = int(raw)
+        if not (min_chars <= val <= max_chars):
+            print(f"⚠️ 範囲外です。{min_chars}〜{max_chars} の間で入力してください。")
+            continue
+        return val
+
+# ==============================
+# ✅ 入力 & 実行（CLI）
+# ==============================
+if __name__ == "__main__":
+    if not HF_TOKEN:
+        raise RuntimeError("HUGGINGFACEHUB_API_TOKEN が設定されていません。環境変数に設定してください。")
+
+    target_chars = ask_target_chars(default=120)
+
+    print("\n📝 広告文にしたい原稿テキストを入力してください（複数行OK）")
+    print("   入力終了は空行（Enterのみ）です。\n")
+
+    lines = []
+    while True:
+        line = input()
+        if line.strip() == "":
+            break
+        lines.append(line)
+
+    text = "\n".join(lines)
+
+    print("\n--- 新聞調 広告文（生成結果）---\n")
+    result = generate_newspaper_ad_api(
+        text=text,
+        target_chars=target_chars,
+        temperature=0.2,
+        max_adjust_rounds=6,
+    )
+
+    print(result)
+    print(f"\n文字数：{len(result)}")
