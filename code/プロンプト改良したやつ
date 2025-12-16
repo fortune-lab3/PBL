@@ -1,4 +1,4 @@
-#広告文生成のみ
+# 広告文生成のみ
 
 import os, time, re
 from huggingface_hub import InferenceClient
@@ -8,7 +8,7 @@ MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
 HF_TOKEN = os.environ.get("HUGGINGFACEHUB_API_TOKEN", "ここにAPIを")
 
 # =========================
-# 前処理（1本目から流用）
+# 前処理
 # =========================
 def remove_strings(text: str) -> str:
     pattern = re.compile(r'【.*?】|[ＲR][ー-]\d+|\n|\t|\s+|■|＊')
@@ -66,7 +66,7 @@ def _call_chat(client: InferenceClient, messages, max_tokens: int, temperature: 
     return ""
 
 # =========================
-# 最終保険：句読点で自然に切る
+# 句読点で自然に切る
 # =========================
 def smart_cut_to_sentence(text: str, target_chars: int, lookback: int = 40) -> str:
     text = normalize_output(text)
@@ -91,7 +91,42 @@ def smart_cut_to_sentence(text: str, target_chars: int, lookback: int = 40) -> s
     return head
 
 # =========================
-# 仕上げ：広告らしい呼びかけを残しつつ「完結」「文末。」「ちょうどN文字」
+# 追加：ローカルで「ちょうどN文字」に強制整形（APIコールなし）
+# =========================
+def force_exact_chars(text: str, target_chars: int) -> str:
+    text = normalize_output(text)
+
+    # 末尾を句点に寄せる
+    if text and not text.endswith("。"):
+        text += "。"
+
+    # 長い→自然にカット
+    if len(text) > target_chars:
+        text = smart_cut_to_sentence(text, target_chars)
+
+    # 短い→定型句で埋める（意味を壊しにくい）
+    fillers = ["ぜひ確かめたい。", "今こそ読みたい。", "続きが気になる。", "見逃せない。"]
+    i = 0
+    while len(text) < target_chars:
+        add = fillers[i % len(fillers)]
+        remain = target_chars - len(text)
+        if remain <= 0:
+            break
+        if len(add) <= remain:
+            text += add
+        else:
+            piece = add[: max(0, remain - 1)] + "。"
+            text += piece
+        i += 1
+
+    # 最終的に長い場合はカット（句点で終える）
+    if len(text) > target_chars:
+        text = text[: target_chars - 1] + "。"
+
+    return text
+
+# =========================
+# 仕上げ：LLMで整形（回数を絞る）
 # =========================
 def finalize_with_llm(
     client: InferenceClient,
@@ -100,7 +135,7 @@ def finalize_with_llm(
     target_chars: int,
     max_tokens: int,
     temperature: float,
-    rounds: int = 8,
+    rounds: int = 3,  # ★ 軽く
 ) -> str:
     ad = normalize_output(ad)
 
@@ -148,12 +183,12 @@ def generate_newspaper_ad_api(
     text: str,
     target_chars: int,
     temperature: float = 0.2,
-    max_adjust_rounds: int = 6,
+    max_adjust_rounds: int = 2,  # ★ 6→2（軽く）
 ) -> str:
     if not HF_TOKEN:
         raise RuntimeError("HUGGINGFACEHUB_API_TOKEN が設定されていません。")
 
-    client = InferenceClient(model=MODEL_ID, token=HF_TOKEN, timeout=60.0)
+    client_local = InferenceClient(model=MODEL_ID, token=HF_TOKEN, timeout=60.0)
 
     cleaned = remove_strings(text)
     cleaned_len = len(cleaned)
@@ -165,7 +200,6 @@ def generate_newspaper_ad_api(
         "必ず日本語のみで回答し、推論過程や自己コメント、タグ、英語を一切出力してはいけません。"
     )
 
-    # 初回生成：新聞調＋広告らしい呼びかけ（CTA）を必須化
     user_prompt = (
         f"次の文章はテレビ番組のナレーション原稿です（約{cleaned_len}文字）。"
         f"この内容をもとに、新聞に掲載できる広告文を作成してください。\n\n"
@@ -184,7 +218,7 @@ def generate_newspaper_ad_api(
     )
 
     ad = _call_chat(
-        client,
+        client_local,
         [{"role": "system", "content": system_prompt},
          {"role": "user", "content": user_prompt}],
         max_tokens=max_tokens,
@@ -195,7 +229,7 @@ def generate_newspaper_ad_api(
 
     ad = normalize_output(ad)
 
-    # 調整ループ：長短の補正（CTAを維持）
+    # 調整ループ：長短の補正（回数を絞る）
     for _ in range(max_adjust_rounds):
         length = count_chars(ad)
         if length == target_chars and ad.endswith("。"):
@@ -227,7 +261,7 @@ def generate_newspaper_ad_api(
             )
 
         ad_new = _call_chat(
-            client,
+            client_local,
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": adjust_prompt}],
             max_tokens=max_tokens,
@@ -238,38 +272,20 @@ def generate_newspaper_ad_api(
 
         ad = normalize_output(ad_new)
 
-    # 仕上げ（CTA必須で整形）
+    # 仕上げ（LLMで少しだけ整える：回数は2回まで）
     ad = finalize_with_llm(
-        client=client,
+        client=client_local,
         system_prompt=system_prompt,
         ad=ad,
         target_chars=target_chars,
         max_tokens=max_tokens,
         temperature=temperature,
-        rounds=10,
+        rounds=2,
     )
     ad = normalize_output(ad)
 
-    # まだズレる場合：句読点カット→仕上げ
-    if count_chars(ad) != target_chars or not ad.endswith("。"):
-        ad = smart_cut_to_sentence(ad, target_chars)
-        ad = finalize_with_llm(
-            client=client,
-            system_prompt=system_prompt,
-            ad=ad,
-            target_chars=target_chars,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            rounds=10,
-        )
-        ad = normalize_output(ad)
-
-    # 最終保険
-    if count_chars(ad) != target_chars:
-        ad = smart_cut_to_sentence(ad, target_chars)
-
-    if count_chars(ad) == target_chars and not ad.endswith("。") and target_chars >= 1:
-        ad = ad[:-1] + "。"
+    # ★ 最後はAPIを呼ばず、ローカルで「ちょうどN文字」に確定
+    ad = force_exact_chars(ad, target_chars)
 
     return ad
 
@@ -316,7 +332,7 @@ if __name__ == "__main__":
         text=text,
         target_chars=target_chars,
         temperature=0.2,
-        max_adjust_rounds=6,
+        max_adjust_rounds=2,
     )
 
     print(result)
