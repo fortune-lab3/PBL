@@ -1,0 +1,98 @@
+# 1. ライブラリのインストール
+!pip install -q streamlit huggingface_hub httpx pyngrok
+
+# 2. アプリ本体のソースコードを「app.py」として書き出し
+# ※ %%writefile 命令を必ず先頭に置きます
+with open("app.py", "w", encoding="utf-8") as f:
+    f.write('''
+import os, time, re, base64
+import streamlit as st
+from huggingface_hub import InferenceClient
+from httpx import ConnectTimeout, ReadTimeout, HTTPError
+
+# --- Hugging Face 設定 ---
+HF_TOKEN = "自分のハギングフェイストークン"
+MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
+
+def remove_strings(text: str) -> str:
+    pattern = re.compile(r'【.*?】|[ＲR][ー-]\d+|\\\\n|\\\\t|\\\\s+|■|＊')
+    return pattern.sub('', text or "")
+
+def normalize_output(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"[a-zA-Z]+", "", text)
+    return text.replace("\\\\n", "").replace("\\\\r", "").strip()
+
+def _extract_message_text(choice) -> str:
+    msg = getattr(choice, "message", None)
+    if isinstance(msg, dict): return msg.get("content", "")
+    return getattr(msg, "content", "")
+
+def _call_chat(client, messages, max_tokens, temperature):
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return _extract_message_text(resp.choices[0]).strip()
+        except (ConnectTimeout, ReadTimeout):
+            time.sleep(2 ** attempt)
+        except HTTPError as e:
+            if getattr(e.response, "status_code", 500) >= 500:
+                time.sleep(2 ** attempt)
+            else: raise
+    return ""
+
+def generate_newspaper_ad_api(text: str, keywords: str, target_chars: int, temperature: float = 0.2) -> str:
+    client = InferenceClient(model=MODEL_ID, token=HF_TOKEN, timeout=60.0)
+    cleaned = remove_strings(text)
+    max_tokens = int(target_chars * 3)
+    kw_inst = f"・必ず次のキーワードを文中に含めてください：{keywords}\\\\n" if keywords else ""
+    prompt = (
+        f"原稿内容をもとに、新聞広告文を作成してください。\\\\n"
+        f"【条件】\\\\n・日本語のみ\\\\n・固有名詞禁止\\\\n・改行なし一段落\\\\n"
+        f"・文末は「。」\\\\n・文字数は {target_chars} 文字前後\\\\n{kw_inst}"
+        f"【原稿】\\\\n{cleaned}\\\\n\\\\n【広告文】"
+    )
+    ad = _call_chat(client, [{"role": "user", "content": prompt}], max_tokens, temperature)
+    return normalize_output(ad)
+
+st.title("新聞広告文 生成アプリ")
+text = st.text_area("原稿を入力してください", height=200)
+keywords = st.text_input("キーワード（任意）")
+target_chars = st.number_input("文字数目安", 30, 500, 200)
+
+if st.button("広告文を生成"):
+    if not text.strip(): st.warning("原稿を入力してください。")
+    else:
+        with st.spinner("生成中..."):
+            ad = generate_newspaper_ad_api(text, keywords, target_chars)
+            st.text_area("結果", ad, height=200)
+            st.write(f"文字数：{len(ad)}")
+''')
+
+# 3. ngrokの設定と起動
+from pyngrok import ngrok
+import subprocess
+import time
+
+# ngrokトークン (あなたのものを流用)
+NGROK_TOKEN = "自分のNGROKトークン"
+ngrok.set_auth_token(NGROK_TOKEN)
+
+# 既存プロセスを一度リセット
+ngrok.kill()
+
+# Streamlitをバックグラウンドで起動 (ファイル名を app.py に指定)
+process = subprocess.Popen(["streamlit", "run", "app.py", "--server.port", "8501"])
+
+# アプリの起動を数秒待つ
+time.sleep(5)
+
+# トンネルを開く
+public_url = ngrok.connect(8501)
+print(f"\n▼▼▼ 下記URLをクリックしてください ▼▼▼")
+print(f"Public URL: {public_url}")
