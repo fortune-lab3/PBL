@@ -1,0 +1,97 @@
+@charset "UTF-8";
+
+.stApp h1,
+.stApp h3,
+textarea,
+input,
+select,
+button{
+    font-family: "游明朝", "Yu Mincho", "Hiragino Mincho ProN",
+        "MS P明朝", "MS Mincho", serif;
+    font-size: 1.1rem;
+}
+
+.stApp h1 {
+    text-align: center;
+    font-size: 5rem;
+}
+
+/* 枠の中 */
+div[data-testid="stTextArea"] textarea,
+div[data-testid="stFileUploader"] span {
+    font-family: "游明朝", "Yu Mincho", "Hiragino Mincho ProN",
+        "MS P明朝", "MS Mincho", serif;
+    font-size: 1rem;
+}
+
+/* サイドバーのラベル */
+div[data-testid="stMarkdownContainer"] p,
+div[data-testid="stButton"] div[data-testid="stMarkdownContainer"] p {
+    font-family: "游明朝", "Yu Mincho", "Hiragino Mincho ProN",
+        "MS P明朝", "MS Mincho", serif;
+    font-size: 1.1rem;
+}
+
+/* サイドバーの枠の中 */
+div[data-testid="stTextInputRootElement"] input {
+    font-family: "游明朝", "Yu Mincho", "Hiragino Mincho ProN",
+        "MS P明朝", "MS Mincho", serif !important;
+    font-size: 1.1rem;
+}
+
+/* 入力選択のラベル */
+div[data-testid="stTextArea"] div[data-testid="stMarkdownContainer"] p,
+div[data-testid="stFileUploader"] div[data-testid="stMarkdownContainer"] p,
+[data-testid="stFileUploaderFileName"] {
+    font-family: "游明朝", "Yu Mincho", "Hiragino Mincho ProN",
+        "MS P明朝", "MS Mincho", serif;
+    font-size: 1.2rem !important;
+}
+
+/* ボタン */
+div[data-testid="stElementContainer"]:has(div[data-testid="stButton"]) {
+    width: 100%;
+    display: flex;
+    justify-content: center;
+}
+
+div[data-testid="stButton"] button {
+    padding: 0.5rem 1rem;
+    transition: .5s;
+}
+
+div[data-testid="stButton"] p {
+    font-family: "游明朝", "Yu Mincho", "Hiragino Mincho ProN",
+        "MS P明朝", "MS Mincho", serif;
+    font-size: 2rem !important;
+    font-weight: bold;
+}
+
+@media (prefers-color-scheme: light) {
+    div[data-testid="stButton"] button {
+        background-color: #7cfad2;
+    }
+
+    div[data-testid="stButton"] button:hover {
+        color: #1E1E1E;
+        background-color: #b8ffea;
+    }
+
+    /* 緑 */
+    .st-av {
+        box-shadow: inset 0 0 0 5px #4bffb7 !important;
+    }
+
+}
+
+@media (prefers-color-scheme: dark) {
+    div[data-testid="stButton"] button {
+        background-color: #ff3030;
+    }
+
+    div[data-testid="stButton"] button:hover {
+        color: #EAEAEA;
+        background-color: #fb7474;
+    }
+}
+
