@@ -1,20 +1,14 @@
 import os, time, re, base64, io
 import streamlit as st
-import google.generativeai as genai
+from huggingface_hub import InferenceClient
+from httpx import ConnectTimeout, ReadTimeout, HTTPError
 from docx import Document
 
-# ==============================
-# Gemini 設定
-# ==============================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-MODEL_ID = "models/gemini-2.5-flash-lite"
+# Hugging Face 設定
+HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN", "")
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
-# ==============================
-# CSS / 画像
-# ==============================
+# CSS
 def load_css(path: str):
     with open(path, "r", encoding="utf-8") as f:
         css = f.read()
@@ -22,40 +16,38 @@ def load_css(path: str):
 
 def load_base64_image(path):
     with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
+        data = f.read()
+    return base64.b64encode(data).decode()
 
 logo_light = load_base64_image("img/logo_black.PNG")
-logo_dark  = load_base64_image("img/logo_white.PNG")
+logo_dark = load_base64_image("img/logo_white.PNG")
 
-# ==============================
-# セッション
-# ==============================
+# セッション初期化
 def init_session_state():
     st.session_state.setdefault("current_ad", "")
     st.session_state.setdefault("edited_ad", "")
     st.session_state.setdefault("current_char_count", 0)
 
-# ==============================
-# 前後処理
-# ==============================
+# 前処理
 def preprocess(text: str) -> str:
     pattern = re.compile(r'【.*?】|[ＲR][ー-]\d+|■|＊')
     return pattern.sub('', text or "")
 
+# 後処理
 def postprocess(text: str) -> str:
-    return (text or "").strip().replace("\n", "").replace("\r", "")
+    text = (text or "").strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return text.replace("\n", "").replace("\r", "").strip()
 
+# 文字数
 def count(text: str) -> int:
     return len((text or "").replace("\n", "").replace("\r", ""))
 
 def realtime_count():
-    st.session_state["current_char_count"] = count(
-        st.session_state.get("edited_ad", "")
-    )
+    text = st.session_state.get("edited_ad", "")
+    st.session_state["current_char_count"] = count(text)
 
-# ==============================
-# 保存
-# ==============================
+# Word保存
 def save_docx(text):
     doc = Document()
     doc.add_paragraph(text)
@@ -64,23 +56,77 @@ def save_docx(text):
     buf.seek(0)
     return buf
 
-# ==============================
-# Gemini 呼び出し
-# ==============================
-def gemini_chat(prompt, temperature=0.2, max_tokens=512):
-    model = genai.GenerativeModel(
-        MODEL_ID,
-        generation_config={
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-        },
-    )
-    res = model.generate_content(prompt)
-    return res.text.strip()
+# HF 呼び出し
+def _hf_text(choice) -> str:
+    msg = getattr(choice, "message", None)
+    if isinstance(msg, dict):
+        return msg.get("content", "")
+    return getattr(msg, "content", "")
 
-# ==============================
-# キーワード / トーン
-# ==============================
+def _hf_chat(client, messages, max_tokens, temperature):
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return _hf_text(resp.choices[0]).strip()
+        except (ConnectTimeout, ReadTimeout):
+            time.sleep(2 ** attempt)
+        except HTTPError as e:
+            if getattr(e.response, "status_code", 500) >= 500:
+                time.sleep(2 ** attempt)
+            else:
+                raise
+    raise RuntimeError("HF API から応答を取得できませんでした")
+
+# 文字数厳格化
+def adjust_length(client, ad, target_length, tone, max_tokens, temperature):
+    ad = postprocess(ad)
+    tone = build_tone(tone)
+    system_prompt = "あなたは日本語文章の文字数を正確に調整する編集者です。"
+
+    for _ in range(2):
+        current_length = len(ad)
+        sub = target_length - current_length
+
+        if abs(sub) <= 5 and ad.endswith("。"):
+            return ad
+
+        if sub > 0:
+            sub_length = f"現在 {current_length}文字なので、{sub} 文字分だけ内容を自然に補ってください。"
+        else:
+            sub_length = f"現在 {current_length}文字なので、{abs(sub)} 文字分だけ内容を自然に削ってください。"
+
+        prompt = (
+            f"次の文章の意味と構成をできるだけ変えずに、文字数だけを調整してください。\n"
+            f"{tone}"
+            f"{sub_length}\n"
+            f"文字数が {target_length} ±5 の範囲に入っていない場合は、必ず文章を修正して再生成\n"
+            f"生成文のみを出力・捕捉などは出力しない\n"
+            f"【元の文章】\n{ad}\n\n"
+            f"【整形後（{target_length}文字）】"
+        )
+
+        new_ad = _hf_chat(
+            client,
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+        if not new_ad:
+            break
+
+        ad = postprocess(new_ad)
+
+    return ad
+
+# キーワード指定
 def split_keywords(keywords: str):
     return [w for w in re.split(r"[ 　]+", keywords.strip()) if w]
 
@@ -94,6 +140,7 @@ def build_keyword(keywords: str):
         "・キーワードが文の繋がりを邪魔しないよう、自然に組み込んでください。\n"
     )
 
+# 表現
 def build_tone(tone: str) -> str:
     if tone == "やわらかい":
         return (
@@ -101,137 +148,126 @@ def build_tone(tone: str) -> str:
             "・ひらがなの比率を上げ、見た目の威圧感をなくすこと\n"
             "・専門用語や難しい概念は、身近な例えに置き換えること\n"
         )
-    return ""
+    else:
+        return ""
 
-# ==============================
-# 文字数調整
-# ==============================
-def adjust_length(ad, target_length, tone):
-    ad = postprocess(ad)
-
-    for _ in range(2):
-        diff = target_length - len(ad)
-        if abs(diff) <= 5 and ad.endswith("。"):
-            return ad
-
-        cmd = "補ってください" if diff > 0 else "削ってください"
-
-        prompt = (
-            "次の文章の意味と構成をできるだけ変えずに、"
-            "文字数だけを調整してください。\n"
-            f"{tone}"
-            f"現在 {len(ad)}文字 → {target_length}文字に{cmd}\n"
-            "生成文のみを出力してください。\n\n"
-            f"【元の文章】{ad}"
-        )
-
-        ad = postprocess(
-            gemini_chat(prompt, temperature=0.1, max_tokens=int(target_length * 1.2))
-        )
-
-    return ad
-
-# ==============================
-# 広告生成
-# ==============================
+# 広告文生成
 def generate_advertisement(text, target_length, keywords, tone, temperature=0.2):
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY が設定されていません。")
+    if not HF_TOKEN:
+        raise RuntimeError("HUGGINGFACEHUB_API_TOKEN が設定されていません。")
 
+    client = InferenceClient(model=MODEL_ID, token=HF_TOKEN, timeout=60)
     cleaned = preprocess(text)
-    tone_txt = build_tone(tone)
-    keyword_txt = build_keyword(keywords)
+    max_tokens=int((target_length) * 1.2)
+    tone = build_tone(tone)
+    keyword = build_keyword(keywords)
 
-    prompt = (
-        f"次の原稿をもとに、新聞のラテ欄風の広告文を書いてください。\n"
-        f"文字数は日本語でちょうど {target_length} 文字\n"
-        f"次にある文体ルールを厳密に守ってください。\n"
-        f"・文の主語・場所・行動が明確になるように書くこと\n"
-        f"・文末には視聴者の興味を引くフックを必ず入れる\n"
-        f"・感情やインパクトのある言葉を使う\n"
-        f"・季節感やテーマがあれば冒頭に入れる\n"
-        f"・応募やプレゼントキャンペーンについては書かない\n"
-        f"【条件】日本語のみ・改行なし\n"
-        f"{tone_txt}"
-        f"{keyword_txt}\n"
-        f"文字数が {target_length} ±5 の範囲に入っていない場合は、文章を修正して再生成してください。\n"
-        f"【原稿】\n{cleaned}\n\n【広告文】"
-    )
-
-    ad = gemini_chat(
-        prompt,
+    ad = _hf_chat(
+        client,
+        [{"role": "user", "content": (
+            f"次の原稿をもとに、新聞のラテ欄風の広告文を書いてください。\n"
+            f"文字数は日本語でちょうど {target_length} 文字\n"
+            f"次にある文体ルールを厳密に守ってください。\n"
+            f"・文の主語・場所・行動が明確になるように書くこと\n"
+            f"・文末には視聴者の興味を引くフックを必ず入れる\n"
+            f"・感情やインパクトのある言葉を使う\n"
+            f"・季節感やテーマがあれば冒頭に入れる\n"
+            f"・応募やプレゼントキャンペーンについては書かない\n"
+            f"【条件】日本語のみ・改行なし\n"
+            f"{tone}\n"
+            f"{keyword}\n\n"
+            f"【原稿】\n{cleaned}\n\n【広告文】"
+        )}],
+        max_tokens=max_tokens,
         temperature=temperature,
-        max_tokens=int(target_length * 1.5),
     )
 
     ad = postprocess(ad)
-    #ad = adjust_length(ad, target_length, tone_txt)
+    ad = adjust_length(client, ad, target_length, tone, max_tokens, temperature=0.1)
+
     return ad
 
-# ==============================
 # Streamlit UI
-# ==============================
 def main():
     st.set_page_config(page_title="南海ことば工房", page_icon="img/favicon.JPG")
     load_css("style.css")
     init_session_state()
-
+    
     st.markdown(
-        f'<div class="logo-container">'
-        f'<img src="data:image/png;base64,{logo_light}" class="logo-light">'
-        f'<img src="data:image/png;base64,{logo_dark}" class="logo-dark">'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+        f'<div class="logo-container"><img src="data:image/png;base64,{logo_light}" class="logo-light"><img src="data:image/png;base64,{logo_dark}" class="logo-dark"></div>', unsafe_allow_html=True)
 
     option = st.sidebar.radio("入力方法を選択", ("テキスト", "ファイル"))
     text = ""
 
     if option == "テキスト":
         text = st.text_area("広告文にしたい原稿を入力してください", height=260)
-        text = re.sub(r"\s+", " ", text.strip())
+        text = text.strip().replace("\r", "")
+        text = text.replace("　", " ")
+        text = re.sub(r"\s+", " ", text)
 
     else:
         uploadfile = st.file_uploader("ファイルを選択", type=["txt", "docx"])
-        if uploadfile:
-            if uploadfile.name.endswith(".txt"):
-                text = uploadfile.read().decode("utf-8", errors="ignore")
-            else:
-                doc = Document(uploadfile)
-                text = "\n".join(p.text for p in doc.paragraphs)
+        if uploadfile is not None:
+            try:
+                if uploadfile.name.endswith(".txt"):
+                    text = uploadfile.read().decode("utf-8", errors="ignore")
+                elif uploadfile.name.endswith(".docx"):
+                    doc = Document(uploadfile)
+                    text = "\n".join([p.text for p in doc.paragraphs])
+            except Exception as e:
+                st.error(f"ファイルの読み込みに失敗しました: {e}")
+                text = ""
 
-    target_length = st.sidebar.number_input("文字数", 10, 500, 100)
+    # 文字数指定
+    target_length = st.sidebar.number_input("文字数", min_value=10, max_value=500, value=100, step=1)
+    
+    # 文章表現選択
     tone = st.sidebar.radio("文章のスタイル", ["かたい", "やわらかい"], horizontal=True)
-    keywords = st.sidebar.text_input("キーワード指定（スペース区切り）")
+    
+    # キーワード指定
+    keywords = st.sidebar.text_input("キーワード指定（スペース区切り）", value="")
 
-    filename = st.sidebar.text_input("保存するファイル名", "newspaper")
+    # 保存ファイル名
+    filename = st.sidebar.text_input("保存するファイル名", value="newspaper")
     ext = st.sidebar.radio("保存形式", [".txt", ".docx"], horizontal=True)
+    download = filename + ext
 
+    # 生成    
     if st.button("広告文を生成"):
-        with st.spinner("広告文を生成中..."):
-            ad = generate_advertisement(text, target_length, keywords, tone)
-            st.session_state["current_ad"] = ad
-            st.session_state["edited_ad"] = ad
-            st.session_state["current_char_count"] = len(ad)
+        try:
+            if not text.strip():
+                st.warning("原稿を入力してください。")
+            else:
+                with st.spinner("広告文を生成中..."):
+                    ad = generate_advertisement(text=text, target_length=target_length, keywords=keywords, tone=tone)
 
+                    st.session_state["current_ad"] = ad
+                    st.session_state["edited_ad"] = ad
+                    st.session_state["current_char_count"] = len(ad)
+       
+        except Exception as e:
+            st.error(f"エラーが発生しました: {e}")
+
+    # ダウンロードボタン
     if st.session_state["current_ad"]:
         st.text_area("生成結果", key="edited_ad", on_change=realtime_count, height=200)
         st.markdown(f"文字数：{st.session_state['current_char_count']} 文字")
-
-        data = (
-            save_docx(st.session_state["edited_ad"])
-            if ext == ".docx"
-            else st.session_state["edited_ad"]
-        )
-
+                
+        final_text = st.session_state["edited_ad"]
+        if ext == ".docx":
+            file_data = save_docx(final_text)
+            mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        else:
+            file_data = final_text
+            mime = "text/plain"
+  
         st.download_button(
-            "ダウンロード",
-            data,
-            file_name=filename + ext,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            if ext == ".docx"
-            else "text/plain",
-        )
+            label="ダウンロード",
+            data=file_data,
+            file_name=download,
+            mime=mime
+            )
 
+# 実行
 if __name__ == "__main__":
     main()
